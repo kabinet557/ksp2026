@@ -5,7 +5,6 @@ import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.widgets import SpanSelector, Cursor
 from scipy.optimize import curve_fit
 from scipy.integrate import cumulative_trapezoid
 from scipy.signal import fftconvolve
@@ -13,9 +12,14 @@ from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
-SHORTLISTED_DIR = r"C:\Users\abhin\Documents\ksp2026\Shortlisted_Data"
-FRED_DIR        = r"C:\Users\abhin\Documents\ksp2026\FRED_Data"
+SHORTLISTED_DIR = r"C:\Users\abhin\Documents\ksp2026\Total_Data"
+FRED_DIR        = r"C:\Users\abhin\Documents\ksp2026\Fit_Fred"
 PLOT_DIR        = os.path.join(FRED_DIR, "outburst_plots")
+
+# Pre-identified outburst catalog (source, band, mjd_start/mjd_end, n_points,
+# ...) produced by the outburst-detection step. Spans are read straight from
+# here instead of being picked by hand.
+OUTBURST_CATALOG_CSV = r"C:\Users\abhin\Documents\ksp2026\outbursts_v4.csv"
 
 BANDS = [
     ("flux_2_20",  "2-20 keV",  "steelblue"),
@@ -25,29 +29,89 @@ BANDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Outburst spans are chosen MANUALLY with the mouse (SpanSelector) -- there
-# is no automatic threshold-crossing detection. SIGMA_THRESH only draws a
-# reference line on the selection plot as a visual guide.
+# Outburst spans now come from OUTBURST_CATALOG_CSV (mjd_start/mjd_end),
+# filtered to the X-ray (MAXI, 2-20 keV) rows with at least
+# MIN_OUTBURST_POINTS data points -- there's no automatic threshold-crossing
+# detection here, that already happened upstream when the catalog was built.
+# SIGMA_THRESH only draws a reference line on the saved plots as a visual
+# guide.
 # ---------------------------------------------------------------------------
 SIGMA_THRESH = 5.0
+
+# Only fit outbursts with at least this many photometric points in the
+# catalog -- below this a 5-parameter Norris (*) tophat fit isn't well
+# constrained. 25-30+ is the sweet spot; tune as needed.
+MIN_OUTBURST_POINTS = 25
+
+CATALOG_INSTRUMENT = "maxi"      # instrument value in OUTBURST_CATALOG_CSV for X-ray rows
+CATALOG_XRAY_BAND  = "2-20keV"   # band value in OUTBURST_CATALOG_CSV for the X-ray band
 
 # Extra context (days) shown around the fitted span in saved plots. Arrays
 # are cropped to this window before plotting (not just axis xlim), so the
 # y-axis autoscales to the outburst instead of the whole light curve.
 VIEW_PAD_DAYS = 20.0
 
-MIN_SPAN_DAYS = 0.5   # ignore accidental drag-clicks shorter than this
+MIN_SPAN_DAYS = 0.5   # skip pathologically short/zero-length catalog spans
 MIN_FIT_POINTS = 10   # need a bit more than the 4-param case since we now fit 5 params
 
 # ---------------------------------------------------------------------------
 # RE-RUN BEHAVIOR: a source is considered "already done" once its per-source
 # CSV exists at outburst_plots/{source}/{source}_norris_tophat_outbursts.csv.
 # On the next run, done sources are skipped (loaded from that CSV straight
-# into the master summary) so only newly-added sources trigger the
-# interactive span selector. List source keys here to force them to be
-# re-selected/re-fit from scratch, e.g. FORCE_REFIT_SOURCES = {"GRS1915+105"}.
+# into the master summary) so only newly-added sources get (re-)fit. List
+# source keys here to force them to be re-fit from scratch, e.g.
+# FORCE_REFIT_SOURCES = {"GRS1915+105"}.
 # ---------------------------------------------------------------------------
 FORCE_REFIT_SOURCES = set()
+
+
+def load_outburst_catalog(csv_path=OUTBURST_CATALOG_CSV, min_points=MIN_OUTBURST_POINTS,
+                           instrument=CATALOG_INSTRUMENT, band_tag=CATALOG_XRAY_BAND):
+    """
+    Load pre-identified X-ray outburst spans from OUTBURST_CATALOG_CSV,
+    keeping only rows for `instrument` + `band_tag` with n_points >=
+    min_points. The same span (per source) is reused to fit every band in
+    BANDS, exactly as the old manually-selected span was reused across
+    bands.
+
+    Returns: {file_stem: [(t_start, t_end, outburst_id), ...]}, sorted by
+    mjd_start within each source. `file_stem` matches the keys returned by
+    find_maxi_files() (i.e. the raw light-curve filename stem), not the
+    prettier `source` label.
+    """
+    if not os.path.exists(csv_path):
+        print(f"[ERROR] Outburst catalog not found: {csv_path}")
+        return {}
+
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    required = {"file_stem", "instrument", "band", "mjd_start", "mjd_end", "n_points", "outburst_id"}
+    missing = required - set(df.columns)
+    if missing:
+        print(f"[ERROR] Outburst catalog {csv_path} is missing column(s): {sorted(missing)}")
+        return {}
+
+    band_norm = df["band"].astype(str).str.replace(" ", "", regex=False).str.lower()
+    mask = (
+        (df["instrument"].astype(str).str.lower() == instrument.lower())
+        & (band_norm == band_tag.replace(" ", "").lower())
+        & (df["n_points"] >= min_points)
+        & ((df["mjd_end"] - df["mjd_start"]) >= MIN_SPAN_DAYS)
+    )
+    sub = df.loc[mask].sort_values(["file_stem", "mjd_start"])
+
+    lookup = {}
+    for _, row in sub.iterrows():
+        key = str(row["file_stem"])
+        lookup.setdefault(key, []).append(
+            (float(row["mjd_start"]), float(row["mjd_end"]), int(row["outburst_id"]))
+        )
+
+    n_outbursts = sum(len(v) for v in lookup.values())
+    print(f"[catalog] {n_outbursts} qualifying outburst(s) (instrument={instrument}, "
+          f"band={band_tag}, n_points>={min_points}) across {len(lookup)} source(s) "
+          f"loaded from {csv_path}")
+    return lookup
 
 
 # ---------------------------------------------------------------------------
@@ -212,79 +276,6 @@ def fit_norris_tophat_span(mjd, flux, err, t_start, t_end):
     res["resid_std"]       = float(np.std(resid))
     res["resid_max_abs"]   = float(np.max(np.abs(resid)))
     return res
-
-
-# ---------------------------------------------------------------------------
-# Interactive manual span selection
-# ---------------------------------------------------------------------------
-def interactive_select_spans(mjd, flux, err, baseline, threshold, source_key, band_label):
-    """
-    Opens an interactive window on the FULL light curve so you can pick
-    outburst windows yourself. Use the matplotlib toolbar to zoom/pan for a
-    precise look before dragging.
-
-      - click + drag       : mark a span (shaded orange, added to the list)
-      - 'z'                : undo the last marked span
-      - Enter, or just
-        closing the window : finish this band and move on
-
-    A crosshair cursor tracks your mouse and the toolbar's coordinate
-    readout shows exact MJD/flux, so you can line the drag up with the real
-    start/end of the rise and decay.
-
-    Returns a list of (t_start, t_end) MJD tuples.
-    """
-    spans = []
-    span_patches = []
-
-    fig, ax = plt.subplots(figsize=(14, 6.5))
-    ax.plot(mjd, flux, "-o", ms=2.5, lw=0.8, color="steelblue", alpha=0.85,
-            label="Lightcurve")
-    ax.axhline(baseline,  color="darkgreen", ls="--", lw=1.2, label="Quiescent Baseline")
-    ax.axhline(threshold, color="crimson",   ls=":",  lw=1.2, label=f"Reference ({SIGMA_THRESH:.0f}σ)")
-    ax.set_title(
-        f"{source_key}  --  {band_label}\n"
-        "Drag to mark an outburst span   |   'z' = undo last   |   Enter or close window = done",
-        fontsize=11,
-    )
-    ax.set_xlabel("MJD")
-    ax.set_ylabel("Flux (ph/cm2/s)")
-    ax.grid(alpha=0.2)
-    ax.legend(fontsize=8, loc="upper right")
-
-    cursor = Cursor(ax, useblit=True, color="gray", linewidth=0.6)
-
-    def onselect(xmin, xmax):
-        if xmax - xmin < MIN_SPAN_DAYS:
-            return
-        spans.append((xmin, xmax))
-        patch = ax.axvspan(xmin, xmax, color="orange", alpha=0.25, zorder=0)
-        span_patches.append(patch)
-        fig.canvas.draw_idle()
-        print(f"    [select] span {len(spans)}: MJD {xmin:.3f} - {xmax:.3f}  "
-              f"(duration {xmax - xmin:.2f} d)")
-
-    def onkey(event):
-        if event.key == "z" and spans:
-            spans.pop()
-            span_patches.pop().remove()
-            fig.canvas.draw_idle()
-            print("    [select] undid last span")
-        elif event.key == "enter":
-            plt.close(fig)
-
-    selector = SpanSelector(
-        ax, onselect, "horizontal",
-        useblit=True,
-        props=dict(alpha=0.25, facecolor="orange"),
-        interactive=True,
-        drag_from_anywhere=True,
-        minspan=MIN_SPAN_DAYS,
-    )
-    fig.canvas.mpl_connect("key_press_event", onkey)
-
-    plt.show()  # blocks until the window is closed or Enter is pressed
-    return spans
 
 
 # ---------------------------------------------------------------------------
@@ -500,16 +491,35 @@ def main():
     os.makedirs(PLOT_DIR, exist_ok=True)
     master_log = os.path.join(FRED_DIR, "all_sources_norris_tophat_conv.log")
 
+    outburst_lookup = load_outburst_catalog()
+    if not outburst_lookup:
+        print("[ERROR] No qualifying outbursts found in the catalog -- nothing to fit.")
+        return
+
     files = find_maxi_files(SHORTLISTED_DIR)
     if not files:
         print(f"[ERROR] No MAXI CSV files found in:\n  {SHORTLISTED_DIR}")
         return
-    print(f"Found {len(files)} source(s): {', '.join(sorted(files))}\n")
+
+    # Only fit sources that have BOTH a raw MAXI light curve on disk AND at
+    # least one qualifying (n_points >= MIN_OUTBURST_POINTS) outburst in the
+    # catalog.
+    source_keys = sorted(set(files) & set(outburst_lookup))
+    no_lightcurve = sorted(set(outburst_lookup) - set(files))
+    no_qualifying_outburst = sorted(set(files) - set(outburst_lookup))
+    if no_lightcurve:
+        print(f"[WARN] {len(no_lightcurve)} source(s) have qualifying outbursts but no MAXI "
+              f"light curve under {SHORTLISTED_DIR}: {no_lightcurve}")
+    if no_qualifying_outburst:
+        print(f"[INFO] {len(no_qualifying_outburst)} source(s) have a light curve but no "
+              f"outburst with n_points >= {MIN_OUTBURST_POINTS} -- skipped.")
+    print(f"\nFitting {len(source_keys)} source(s): {', '.join(source_keys)}\n")
 
     summary_rows = []
 
-    for source_key in sorted(files):
+    for source_key in source_keys:
         fp = files[source_key]
+        spans = outburst_lookup[source_key]  # [(t_start, t_end, outburst_id), ...]
 
         # ------------------------------------------------------------
         # SKIP sources that already have a completed fit. The per-source
@@ -544,7 +554,6 @@ def main():
 
         per_band_outbursts = {}
         source_rows = []
-        spans = None
         for flux_col, band_label, _ in BANDS:
             if flux_col not in df.columns:
                 continue
@@ -559,19 +568,16 @@ def main():
 
             baseline, threshold = robust_baseline_threshold(flux[valid])
             if band_label == "2-20 keV":
-                print(f"  {band_label:12s} -> opening selection window "
-                  f"(baseline={baseline:.4f}, reference={threshold:.4f})")
-                spans = interactive_select_spans(mjd, flux, err, baseline, threshold,
-                                              source_key, band_label)
-                print(f"  {band_label:12s} -> {len(spans)} span(s) selected")
+                print(f"  {band_label:12s} -> {len(spans)} catalog span(s) "
+                      f"(baseline={baseline:.4f}, reference={threshold:.4f})")
 
             outbursts = []
-            for i, (t_start, t_end) in enumerate(spans, start=1):
+            for (t_start, t_end, outburst_id) in spans:
                 fit_res = fit_norris_tophat_span(mjd, flux, err, t_start, t_end)
                 outbursts.append((t_start, t_end, baseline, threshold, fit_res))
 
-                fred_path  = os.path.join(source_dir, f"{flux_col}_outburst{i}_fred.png")
-                resid_path = os.path.join(source_dir, f"{flux_col}_outburst{i}_resid.png")
+                fred_path  = os.path.join(source_dir, f"{flux_col}_outburst{outburst_id}_fred.png")
+                resid_path = os.path.join(source_dir, f"{flux_col}_outburst{outburst_id}_resid.png")
                 plot_fred_characterization(source_key, band_label, mjd, flux, err,
                                             baseline, threshold, t_start, t_end,
                                             fit_res, fred_path)
@@ -580,7 +586,7 @@ def main():
                 if fit_res and "popt" in fit_res and fit_res.get("shape"):
                     p, sh = fit_res["popt"], fit_res["shape"]
                     row = {
-                        "source": source_key, "band": band_label, "outburst_idx": i,
+                        "source": source_key, "band": band_label, "outburst_idx": outburst_id,
                         "span_start_mjd": t_start, "span_end_mjd": t_end,
                         "baseline": baseline, "threshold": threshold,
                         "A": p[0], "t0": p[1], "tau1": p[2], "tau2": p[3], "width": p[4],
